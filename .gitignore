@@ -34,3 +34,14 @@ models/
 # OS
 .DS_Store
 Thumbs.db
+
+*.sqlite3
+*.sqlite3-*
+*_runtime.log
+*.log
+
+# SQLite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*

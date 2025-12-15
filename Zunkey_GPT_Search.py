@@ -1,8 +1,11 @@
 # Zunkey_GPT_Search.py
-# Zunkey_GPT_Search 1.0.0
-# Tkinter + DDG検索 + HTML抽出 + ローカルLLM要約(任意) + RAG + ローカル検索DB
-# 追加: 記事削除 / キーワード削除 / 全記事テキストエクスポート
-# 改善: RAG検索に閾値(min_sim)導入 / hash埋め込みを安定ハッシュへ（起動ごとに変わらない）
+# Zunkey_GPT_Search 1.0.3
+# Tkinter + DDG検索 + HTML抽出 + ローカルLLM要約(任意) + RAG + 関連ワード（旧UI維持）
+# 仕様:
+# ・Python実行とNuitka（standalone）双方対応
+# ・GPT-OSSモデルは起動時に必ず自動ダウンロード（保存先はアプリ直下 models/gpt-oss）
+# ・UIは旧版（Zunkey_GPTwiki系）を維持
+# ・関連ワードの精度を上げるため、採用条件（hits/閾値）を強化し暴走を抑制
 
 import os
 import sys
@@ -20,37 +23,72 @@ import webbrowser
 from datetime import datetime
 
 APP = "Zunkey_GPT_Search"
-VER = "1.0.0"
+VER = "1.0.16"
 
-DB_PATH = "zunkey_gpt_search.sqlite3"
-SETTINGS_PATH = "settings.json"
-LOG_PATH = "zunkey_gpt_search_runtime.log"
+# ==================== path helpers（Python/EXE両対応） ====================
+def is_frozen_app() -> bool:
+    if "__compiled__" in globals():  # Nuitka
+        return True
+    if bool(getattr(sys, "frozen", False)):  # PyInstaller等
+        return True
+    if hasattr(sys, "_MEIPASS"):
+        return True
+    return False
 
+def exe_dir() -> str:
+    try:
+        p = sys.executable if is_frozen_app() else sys.argv[0]
+        return os.path.dirname(os.path.abspath(p))
+    except Exception:
+        return os.getcwd()
+
+BASE_DIR = exe_dir()
+
+def must_writable_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+    test = os.path.join(path, "_zunkey_write_test.tmp")
+    with open(test, "w", encoding="utf-8") as f:
+        f.write("ok")
+    os.remove(test)
+
+# アプリ直下に固定（要件）
+DATA_DIR = BASE_DIR
+
+DB_PATH = os.path.join(DATA_DIR, "zunkey_gpt_search.sqlite3")
+SETTINGS_PATH = os.path.join(DATA_DIR, "settings.json")
+LOG_PATH = os.path.join(DATA_DIR, "zunkey_gpt_search_runtime.log")
+
+MODELS_DIR = os.path.join(DATA_DIR, "models")
+GPTOSS_DIR = os.path.join(MODELS_DIR, "gpt-oss")
+GPTOSS_FILE = "gpt-oss-20b-Q5_K_M.gguf"
+
+# ==================== defaults ====================
 DEFAULT = dict(
     topic="",
 
-    # LLM要約（llama.cpp）
-    use_llm=True,
-    llm_model_path=r"models\gpt-oss\gpt-oss-20b-Q5_K_M.gguf",
-    llm_model_url="",  # optional（直リンクを入れたら自動DLする）
+    # LLM（llama.cpp）
+    use_llm=True,  # UIトグルあり
+    llm_model_path=os.path.join("models", "gpt-oss", GPTOSS_FILE),  # 相対扱い（DATA_DIR基準）
+    llm_model_url="https://huggingface.co/unsloth/gpt-oss-20b-GGUF/resolve/main/gpt-oss-20b-Q5_K_M.gguf?download=true",
     llm_n_ctx=4096,
     llm_n_threads=max(4, os.cpu_count() or 8),
-    llm_n_gpu_layers=-1,   # -1: 可能な限りGPUへ
+    llm_n_gpu_layers=-1,
     llm_temperature=0.2,
     llm_top_p=0.9,
     llm_repeat_penalty=1.1,
-    llm_timeout_sec=75,
+    llm_timeout_sec=90,
     llm_max_tokens=520,
 
-    # Embedding（sentence-transformersがあれば使う。無ければ安定hash）
+    # Embedding（入っていればsentence-transformers、無ければhash）
     embed_dim=384,
     embedder_name="sentence-transformers/all-MiniLM-L6-v2",
 
     # Search
     search_region="jp-jp",
+    force_html_search_when_frozen=True,
     search_safesearch="moderate",
     search_results=8,
-    fetch_timeout_sec=25,
+    search_timeout_sec=25,
     max_pages_per_tick=2,
     tick_sleep_sec=2.0,
 
@@ -59,25 +97,31 @@ DEFAULT = dict(
     max_store_chars=25000,
     max_kw_chars=14000,
 
-    # LLMへ渡す本文の事前カット（ctx対策）
+    # LLMへ渡す本文の事前カット
     chunk_chars_for_llm=2800,
     summary_chars=1000,
 
-    # Related terms scoring
-    rel_sim_threshold=0.22,  # topicとのcos類似（0-1）
+    # score weights
     w_rel=0.65,
     w_qua=0.35,
 
     # RAG
     rag_topk=8,
-    rag_min_sim=0.28,  # 0.25〜0.35くらいで調整
-    rag_embed_title_summary=True,  # True: title+summary を埋め込みに使う
+    rag_min_sim=0.24,  # 何でも引っかかる対策（hash環境で上げ気味）
 
-    # Avoid domains（固定の除外）
+    # related terms（旧機能復活。精度改善）
+    use_related=True,
+    related_use_for_query=True,   # 旧挙動：関連語をクエリに混ぜる（暴走しない条件つき）
+    related_pick_prob=0.75,
+    rel_sim_threshold=0.24,       # topic-term のcos類似しきい値（少し厳しく）
+    related_min_hits=2,           # 複数回登場した語のみ採用
+    related_min_score=58.0,       # 関連語スコア下限（暴走防止）
+    related_limit=200,
+
     avoid_domains=["x.com", "twitter.com", "facebook.com", "bsky.app"],
 )
 
-# ---------------- utils ----------------
+# ==================== utils ====================
 def now_hms():
     return time.strftime("%H:%M:%S")
 
@@ -115,18 +159,6 @@ def get_domain(u: str) -> str:
     except Exception:
         return ""
 
-def domain_is_avoided(domain: str, avoid_list) -> bool:
-    d = (domain or "").lower().strip()
-    if not d:
-        return False
-    for a in (avoid_list or []):
-        a = (a or "").lower().strip()
-        if not a:
-            continue
-        if d == a or d.endswith("." + a):
-            return True
-    return False
-
 def safe_json_obj(text: str):
     text = strip_ctrl(text or "")
     i = text.find("{")
@@ -139,6 +171,28 @@ def safe_json_obj(text: str):
     except Exception:
         return None
 
+def read_json(path: str):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def write_json(path: str, obj):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def resolve_in_data(path: str) -> str:
+    path = (path or "").strip()
+    if not path:
+        return ""
+    if os.path.isabs(path):
+        return os.path.normpath(path)
+    return os.path.normpath(os.path.join(DATA_DIR, path))
+
 def pip_install(pkgs, log):
     if not pkgs:
         return
@@ -146,51 +200,55 @@ def pip_install(pkgs, log):
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", *pkgs])
 
 def ensure_packages(log):
-    miss = []
+    # Python実行時のみpip導入。EXEでは同梱されてる前提（無ければエラーにする）
     def has(mod):
         try:
             __import__(mod)
             return True
-        except Exception:
+        except Exception as e:
+            log(f"import fail: {mod} ({type(e).__name__}: {e})")
             return False
 
-    if not has("httpx"):
-        miss.append("httpx>=0.28.1")
-    if not has("ddgs"):
-        miss.append("ddgs>=9.0.0")
-    if not has("bs4"):
-        miss.append("beautifulsoup4>=4.12.0")
-    if not has("lxml"):
-        miss.append("lxml>=4.9.4")
-    if not has("trafilatura"):
-        miss.append("trafilatura>=1.9.0")
-    if not has("numpy"):
-        miss.append("numpy>=1.24.0")
+    required = [
+        ("httpx", "httpx>=0.28.1"),
+        ("ddgs", "ddgs>=9.0.0"),
+        ("bs4", "beautifulsoup4>=4.12.0"),
+        ("lxml", "lxml>=4.9.4"),
+        ("numpy", "numpy>=1.24.0"),
+    ]
+    optional = [
+        ("trafilatura", "trafilatura>=1.9.0"),
+    ]
 
-    if miss:
-        pip_install(miss, log)
+    miss_req = [pip for mod, pip in required if not has(mod)]
+    miss_opt = [pip for mod, pip in optional if not has(mod)]
+
+    if is_frozen_app():
+        if miss_req:
+            log("EXEに必須パッケージが同梱されていません（ビルド見直し）: " + str(miss_req))
+            return False
+        if miss_opt:
+            log("任意パッケージ未同梱 -> フォールバックで動作: " + str(miss_opt))
+        return True
+
+    if miss_req:
+        pip_install(miss_req, log)
+    if miss_opt:
+        log("任意パッケージ未導入 -> フォールバックで動作: " + str(miss_opt))
+    return True
 
 def load_settings():
     s = dict(DEFAULT)
-    if os.path.exists(SETTINGS_PATH):
-        try:
-            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
-                j = json.load(f)
-            if isinstance(j, dict):
-                s.update(j)
-        except Exception:
-            pass
+    j = read_json(SETTINGS_PATH)
+    if isinstance(j, dict):
+        s.update(j)
     return s
 
 def save_settings(s):
-    try:
-        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-            json.dump(s, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    write_json(SETTINGS_PATH, s)
 
-# ---------------- DB ----------------
-class Store:
+# ==================== DB ====================
+class DB:
     def __init__(self, path: str):
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL;")
@@ -211,17 +269,36 @@ class Store:
             quality REAL,
             score REAL,
             emb BLOB
-        );""")
+        );
+        """)
 
+        # related: 精度改善のため hits を追加
         cur.execute("""
         CREATE TABLE IF NOT EXISTS related(
             term TEXT PRIMARY KEY,
             score REAL,
+            hits INTEGER DEFAULT 0,
             last_seen TEXT,
             source_url TEXT
-        );""")
+        );
+        """)
 
         self.conn.commit()
+        self._ensure_columns()
+
+    def _table_cols(self, table: str):
+        c = self.conn.cursor()
+        c.execute(f"PRAGMA table_info({table});")
+        return {r[1] for r in c.fetchall()}
+
+    def _ensure_columns(self):
+        cols = self._table_cols("related")
+        if "hits" not in cols:
+            try:
+                self.conn.execute("ALTER TABLE related ADD COLUMN hits INTEGER DEFAULT 0;")
+                self.conn.commit()
+            except Exception:
+                pass
 
     def upsert_doc(self, url, domain, title, summary, cleaned, created_at, relevance, quality, score, emb):
         with self.lock:
@@ -302,24 +379,27 @@ class Store:
         term = (term or "").strip()
         if not term:
             return
+        score = float(score)
         with self.lock:
+            # scoreはMAXで保ちつつ、hitsを増やす
             self.conn.execute("""
-            INSERT INTO related(term,score,last_seen,source_url)
-            VALUES(?,?,?,?)
+            INSERT INTO related(term,score,hits,last_seen,source_url)
+            VALUES(?,?,?,?,?)
             ON CONFLICT(term) DO UPDATE SET
               score=MAX(related.score, excluded.score),
+              hits=related.hits + 1,
               last_seen=excluded.last_seen,
               source_url=excluded.source_url
-            """, (term, float(score), iso_utc(), source_url))
+            """, (term, score, 1, iso_utc(), source_url))
             self.conn.commit()
 
     def list_related(self, limit=200):
         with self.lock:
             c = self.conn.cursor()
             c.execute("""
-            SELECT term,score,last_seen,source_url
+            SELECT term,score,hits,last_seen,source_url
             FROM related
-            ORDER BY score DESC
+            ORDER BY score DESC, hits DESC
             LIMIT ?
             """, (int(limit),))
             return c.fetchall()
@@ -343,7 +423,7 @@ class Store:
             c.execute("SELECT id, emb FROM docs WHERE emb IS NOT NULL AND length(emb)>0")
             return c.fetchall()
 
-# ---------------- Embedding ----------------
+# ==================== Embedding ====================
 import numpy as np
 
 JA = re.compile(r"[ぁ-んァ-ン一-龠々〆ヵヶー]{2,}")
@@ -361,11 +441,6 @@ def tokenize(text: str):
     out = [t for t in JA.findall(text)]
     out += [t.lower() for t in EN.findall(text)]
     return out
-
-def stable_hash32(s: str) -> int:
-    b = (s or "").encode("utf-8", "ignore")
-    d = hashlib.md5(b).digest()
-    return int.from_bytes(d[:4], "little", signed=False)
 
 class Embedder:
     def __init__(self, s, log):
@@ -394,8 +469,7 @@ class Embedder:
             for w in tokenize(t):
                 if w in STOP:
                     continue
-                idx = stable_hash32(w) % self.dim
-                v[idx] += 1.0
+                v[(hash(w) & 0x7fffffff) % self.dim] += 1.0
             n = float(np.linalg.norm(v))
             if n > 0:
                 v /= n
@@ -408,9 +482,6 @@ def vec_blob(v):
 def blob_vec(b, dim):
     if not b:
         return np.zeros((dim,), dtype=np.float32)
-    # サイズ不整合は捨てる（embedderのdim変更や旧DB対策）
-    if len(b) < dim * 4:
-        return np.zeros((dim,), dtype=np.float32)
     return np.frombuffer(b, dtype=np.float32, count=dim)
 
 def cos(a, b):
@@ -422,42 +493,133 @@ def cos(a, b):
         return 0.0
     return float(np.dot(a, b) / (na * nb))
 
-# ---------------- Web search / fetch / extract ----------------
-JUNK_HINTS = [
-    "プライバシー", "利用規約", "Cookie", "クッキー", "広告", "免責", "ログイン", "会員登録",
-    "シェア", "フォロー", "関連記事", "人気記事", "メニュー", "ナビ", "購読", "通知"
-]
+# ==================== Web search / fetch / extract ====================
+JUNK_HINTS = ["プライバシー", "利用規約", "Cookie", "クッキー", "広告", "免責", "ログイン", "会員登録",
+              "シェア", "フォロー", "関連記事", "人気記事", "メニュー", "ナビ", "購読", "通知"]
+
+def ddg_html_search(query, s, log):
+    """DuckDuckGoのHTML版を直接取得してパースするフォールバック検索。
+    ddgs側の仕様変更や一時的な壊れでKeyError等が出たときの保険。
+    """
+    import httpx
+    from bs4 import BeautifulSoup
+
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote_plus(q)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Zunkey_GPT_Search",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ja,en;q=0.8",
+    }
+
+    timeout = int(s.get("search_timeout_sec", 25))
+    with httpx.Client(follow_redirects=True, timeout=timeout, headers=headers) as c:
+        r = c.get(url)
+        r.raise_for_status()
+        html = r.text or ""
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    out = []
+    for a in soup.select("a.result__a"):
+        href = a.get("href") or ""
+        title = " ".join(list(a.stripped_strings))[:200]
+
+        u = href
+        if "uddg=" in href:
+            mm = re.search(r"uddg=([^&]+)", href)
+            if mm:
+                try:
+                    u = urllib.parse.unquote_plus(mm.group(1))
+                except Exception:
+                    u = href
+
+        if not u.startswith("http"):
+            continue
+
+        snippet = ""
+        try:
+            cont = a.find_parent("div", class_=re.compile(r"result", re.I))
+            if cont:
+                sn = cont.select_one(".result__snippet") or cont.select_one(".result__content")
+                if sn:
+                    snippet = " ".join(list(sn.stripped_strings))[:400]
+        except Exception:
+            snippet = ""
+
+        out.append({"url": u, "title": title or u, "snippet": snippet})
+        if len(out) >= int(s.get("search_results", 8)):
+            break
+
+    log(f"DDG HTML fallback results={len(out)}")
+    return out
+
 
 def ddg_search(query, s, log):
     time.sleep(random.uniform(1.2, 3.4))
-    try:
-        from ddgs import DDGS
-    except Exception:
-        from duckduckgo_search import DDGS
 
     res = []
+
+
+    # Nuitka等で凍結（frozen）された実行環境では、ddgs側がブロック/仕様変更で落ちやすいことがある。
+    # その場合はHTML版を直接パースする方式を優先する。
+    if bool(s.get("force_html_search_when_frozen", True)) and bool(getattr(sys, "frozen", False)):
+        try:
+            return ddg_html_search(query, s, log)
+        except Exception as e:
+            log(f"DDG HTML fallback ERROR {type(e).__name__}: {e}")
+            return []
+
+    timeout = int(s.get("search_timeout_sec", 25))
+    region = s.get("search_region", "jp-jp")
+    safesearch = s.get("search_safesearch", "moderate")
+    max_results = int(s.get("search_results", 8))
+
+    # 1) ddgs（ライブラリ）を試す
     try:
-        with DDGS(timeout=int(s.get("fetch_timeout_sec", 25))) as ddgs:
-            for r in ddgs.text(
-                query,
-                region=s.get("search_region", "jp-jp"),
-                safesearch=s.get("search_safesearch", "moderate"),
-                max_results=int(s.get("search_results", 8))
-            ):
+        try:
+            from ddgs import DDGS
+        except Exception:
+            from duckduckgo_search import DDGS
+
+        with DDGS(timeout=timeout) as ddgs:
+            try:
+                it = ddgs.text(query, region=region, safesearch=safesearch, max_results=max_results)
+            except TypeError:
+                it = ddgs.text(keywords=query, region=region, safesearch=safesearch, max_results=max_results)
+
+            for r in it:
                 if not r:
                     continue
                 url = r.get("href") or r.get("url") or ""
-                if not url:
-                    continue
-                res.append({
-                    "url": url,
-                    "title": r.get("title", "") or "",
-                    "snippet": r.get("body", "") or r.get("snippet", "") or ""
-                })
-    except Exception as e:
-        log(f"DDG ERROR {type(e).__name__}: {e}")
-    return res
+                if url:
+                    res.append({
+                        "url": url,
+                        "title": r.get("title", "") or "",
+                        "snippet": r.get("body", "") or r.get("snippet", "") or ""
+                    })
 
+    except KeyError as e:
+        # ddgsが内部仕様変更で壊れた時に出がち
+        log(f"DDG ERROR KeyError: {e} -> HTML fallback")
+        try:
+            res = ddg_html_search(query, s, log)
+        except Exception as e2:
+            log(f"DDG HTML fallback ERROR {type(e2).__name__}: {e2}")
+            res = []
+
+    except Exception as e:
+        log(f"DDG ERROR {type(e).__name__}: {e} -> HTML fallback")
+        try:
+            res = ddg_html_search(query, s, log)
+        except Exception as e2:
+            log(f"DDG HTML fallback ERROR {type(e2).__name__}: {e2}")
+            res = []
+
+    return res
 def fetch_html(url, timeout_sec, log):
     import httpx
     headers = {
@@ -526,7 +688,7 @@ def clean_text(html: str, url: str) -> str:
     # 2) BeautifulSoup fallback
     try:
         from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, "lxml")
+        soup = BeautifulSoup(html, "html.parser")
         for tag in soup(["script", "style", "noscript", "svg", "canvas", "iframe", "header", "footer", "nav", "aside", "form"]):
             tag.decompose()
         t = "\n".join(soup.stripped_strings)
@@ -598,59 +760,87 @@ def quality_heuristic(url: str, text_len: int) -> float:
         sc -= 12
     return float(max(0.0, min(100.0, sc)))
 
-# ---------------- Local LLM (llama.cpp) ----------------
+# ==================== Local LLM (llama.cpp) ====================
 class LocalLLM:
     def __init__(self, s, log):
         self.s = s
         self.log = log
         self.llm = None
         self.lock = threading.Lock()
+        self.downloading = threading.Event()
 
-    def _download(self, url, dst):
-        import httpx
-        self.log("LLM download: " + url)
-        os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
-        tmp = dst + ".part"
-        with httpx.Client(follow_redirects=True, timeout=None, headers={"User-Agent": "Mozilla/5.0 Zunkey_GPT_Search"}) as c:
-            with c.stream("GET", url) as r:
-                r.raise_for_status()
-                total = int(r.headers.get("content-length") or 0)
-                got = 0
-                with open(tmp, "wb") as f:
-                    for ch in r.iter_bytes(chunk_size=1024 * 1024):
-                        if not ch:
-                            continue
-                        f.write(ch)
-                        got += len(ch)
-                        if total > 0:
-                            self.log(f"download {got*100/total:.1f}% {got/1e9:.2f}GB/{total/1e9:.2f}GB")
-                        else:
-                            self.log(f"download {got/1e9:.2f}GB")
-        os.replace(tmp, dst)
-        self.log("LLM download complete: " + dst)
+    def model_path_abs(self) -> str:
+        return resolve_in_data(self.s.get("llm_model_path", ""))
+
+    def ensure_model_download(self):
+        # 起動時に必ず呼ぶ（要件）
+        path = self.model_path_abs()
+        url = (self.s.get("llm_model_url", "") or "").strip()
+
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        if os.path.exists(path) and os.path.getsize(path) > 1024 * 1024:
+            self.log("LLM model already exists: " + path)
+            return
+
+        if not url:
+            self.log("LLM model url is empty（自動DL不可）")
+            return
+
+        if self.downloading.is_set():
+            return
+
+        self.downloading.set()
+
+        def _dl():
+            try:
+                import httpx
+                self.log("LLM download start: " + url)
+                tmp = path + ".part"
+                with httpx.Client(follow_redirects=True, timeout=None, headers={"User-Agent": "Mozilla/5.0 Zunkey_GPT_Search"}) as c:
+                    with c.stream("GET", url) as r:
+                        r.raise_for_status()
+                        total = int(r.headers.get("content-length") or 0)
+                        got = 0
+                        t0 = time.time()
+                        with open(tmp, "wb") as f:
+                            for ch in r.iter_bytes(chunk_size=1024 * 1024):
+                                if not ch:
+                                    continue
+                                f.write(ch)
+                                got += len(ch)
+                                if total > 0:
+                                    pct = got * 100.0 / total
+                                    sec = max(0.001, time.time() - t0)
+                                    sp = got / sec / (1024 * 1024)
+                                    self.log(f"download {pct:.1f}% {got/1e9:.2f}GB/{total/1e9:.2f}GB {sp:.1f}MB/s")
+                                else:
+                                    self.log(f"download {got/1e9:.2f}GB")
+                os.replace(tmp, path)
+                self.log("LLM download complete: " + path + f" ({os.path.getsize(path)/1e9:.2f}GB)")
+            except Exception as e:
+                self.log(f"LLM download failed {type(e).__name__}: {e}")
+            finally:
+                self.downloading.clear()
+
+        threading.Thread(target=_dl, daemon=True).start()
 
     def load(self):
         with self.lock:
             if self.llm is not None:
                 return True
 
-            path = (self.s.get("llm_model_path", "") or "").strip()
-            if not path:
-                self.log("LLM model path is empty")
-                return False
-
+            path = self.model_path_abs()
             if not os.path.exists(path):
-                url = (self.s.get("llm_model_url", "") or "").strip()
-                if url:
-                    self._download(url, path)
-
-            if not os.path.exists(path):
-                self.log("LLMモデルが見つからない: " + os.path.abspath(path))
+                self.log("LLMモデルが見つからない: " + path)
                 return False
 
             try:
                 from llama_cpp import Llama
-            except Exception:
+            except Exception as e:
+                if is_frozen_app():
+                    self.log("EXEではllama-cpp-python未同梱の可能性: " + str(e))
+                    return False
                 pip_install(["llama-cpp-python>=0.3.0"], self.log)
                 from llama_cpp import Llama
 
@@ -701,8 +891,10 @@ class LocalLLM:
         return head + mark + body[:900]
 
     def summarize(self, topic, title, url, cleaned):
+        if self.downloading.is_set():
+            return None
         if not self.load():
-            raise RuntimeError("LLM not ready")
+            return None
 
         chunk = clamp(cleaned, int(self.s.get("chunk_chars_for_llm", 2800)))
 
@@ -722,17 +914,20 @@ class LocalLLM:
         t0 = time.time()
         buf = ""
 
-        gen = self.llm(
-            prompt,
-            max_tokens=int(self.s.get("llm_max_tokens", 520)),
-            temperature=float(self.s.get("llm_temperature", 0.2)),
-            top_p=float(self.s.get("llm_top_p", 0.9)),
-            repeat_penalty=float(self.s.get("llm_repeat_penalty", 1.1)),
-            stream=True,
-        )
+        try:
+            gen = self.llm(
+                prompt,
+                max_tokens=int(self.s.get("llm_max_tokens", 520)),
+                temperature=float(self.s.get("llm_temperature", 0.2)),
+                top_p=float(self.s.get("llm_top_p", 0.9)),
+                repeat_penalty=float(self.s.get("llm_repeat_penalty", 1.1)),
+                stream=True,
+            )
+        except Exception:
+            return None
 
         for part in gen:
-            if time.time() - t0 > int(self.s.get("llm_timeout_sec", 75)):
+            if time.time() - t0 > int(self.s.get("llm_timeout_sec", 90)):
                 self.log("LLM timeout -> fallback")
                 break
             try:
@@ -745,37 +940,27 @@ class LocalLLM:
 
         return None
 
-# ---------------- RAG index (in-memory) ----------------
-class RagIndex:
+# ==================== RAG memory (in-memory) ====================
+class RagMem:
     def __init__(self, dim):
         self.dim = dim
         self.ids = []
         self.mat = np.zeros((0, dim), dtype=np.float32)
         self.lock = threading.Lock()
 
-    def rebuild(self, store: Store):
-        rows = store.iter_embeddings()
+    def rebuild(self, db: DB):
+        rows = db.iter_embeddings()
         ids = []
         vecs = []
         for doc_id, emb in rows:
-            v = blob_vec(emb, self.dim)
-            if v is None or v.shape[0] != self.dim:
-                continue
-            # 念のため正規化
-            n = float(np.linalg.norm(v))
-            if n > 0:
-                v = v / n
             ids.append(int(doc_id))
-            vecs.append(v)
+            vecs.append(blob_vec(emb, self.dim))
         with self.lock:
             self.ids = ids
             self.mat = np.vstack(vecs).astype(np.float32) if vecs else np.zeros((0, self.dim), dtype=np.float32)
 
     def upsert(self, doc_id, vec):
         vec = np.asarray(vec, dtype=np.float32)
-        n = float(np.linalg.norm(vec))
-        if n > 0:
-            vec = vec / n
         with self.lock:
             if doc_id in self.ids:
                 i = self.ids.index(doc_id)
@@ -800,31 +985,19 @@ class RagIndex:
             self.ids = []
             self.mat = np.zeros((0, self.dim), dtype=np.float32)
 
-    def search(self, qvec, topk=8, min_sim=0.28):
+    def search(self, qvec, topk=8):
         q = np.asarray(qvec, dtype=np.float32)
-        nq = float(np.linalg.norm(q))
-        if nq > 0:
-            q = q / nq
         with self.lock:
             if self.mat.shape[0] == 0:
                 return []
             sims = self.mat @ q
-            order = np.argsort(-sims)
+            idx = np.argsort(-sims)[:int(topk)]
+            return [(self.ids[int(i)], float(sims[int(i)])) for i in idx]
 
-            out = []
-            for i in order:
-                sim = float(sims[int(i)])
-                if sim < float(min_sim):
-                    break
-                out.append((self.ids[int(i)], sim))
-                if len(out) >= int(topk):
-                    break
-            return out
-
-# ---------------- Engine ----------------
-class SearchEngine:
-    def __init__(self, store, s, emb: Embedder, rag: RagIndex, log, ui_event, set_status):
-        self.store = store
+# ==================== Engine ====================
+class Engine:
+    def __init__(self, db, s, emb: Embedder, rag: RagMem, log, ui_event, set_status):
+        self.db = db
         self.s = s
         self.emb = emb
         self.rag = rag
@@ -860,27 +1033,44 @@ class SearchEngine:
         self.stop.set()
 
     def pick_query(self):
-        rels = self.store.list_related(limit=80)
+        if not bool(self.s.get("use_related", True)) or not bool(self.s.get("related_use_for_query", True)):
+            return self.topic
+
+        rels = self.db.list_related(limit=80)
         cands = []
-        for term, score, _, _ in rels:
+        min_hits = int(self.s.get("related_min_hits", 2))
+        min_score = float(self.s.get("related_min_score", 58.0))
+
+        for term, score, hits, _, _ in rels:
             term = str(term).strip()
             if len(term) < 2 or len(term) > 24:
                 continue
-            cands.append((float(score), term))
-        cands.sort(reverse=True)
+            try:
+                score = float(score or 0)
+                hits = int(hits or 0)
+            except Exception:
+                continue
+            if hits < min_hits:
+                continue
+            if score < min_score:
+                continue
+            cands.append((score, hits, term))
 
-        if cands and random.random() < 0.75:
-            best = cands[0][1]
+        cands.sort(reverse=True)
+        if cands and random.random() < float(self.s.get("related_pick_prob", 0.75)):
+            best = cands[0][2]
             if best and best != self.topic:
                 return f"{self.topic} {best}"
         return self.topic
 
     def loop(self):
         self.log("[start] preflight開始")
-        ensure_packages(self.log)
+        ok = ensure_packages(self.log)
+        if not ok:
+            self.set_status("起動失敗: 依存パッケージ不足")
+            return
 
-        # 既知URL
-        for _, _, _, _, _, url, _ in self.store.list_docs(limit=5000):
+        for _, _, _, _, _, url, _ in self.db.list_docs(limit=5000):
             if url:
                 self.seen.add(norm_url(url))
 
@@ -905,20 +1095,19 @@ class SearchEngine:
                 for r in res:
                     if self.stop.is_set():
                         break
-                    u = norm_url(r.get("url", "") or "")
+                    u = norm_url(r.get("url", ""))
                     if not u:
                         continue
                     if u in self.seen:
                         continue
 
                     d = get_domain(u)
-                    if domain_is_avoided(d, self.s.get("avoid_domains", [])):
-                        self.seen.add(u)
+                    if d in (self.s.get("avoid_domains", []) or []):
                         continue
 
-                    ok = self.process(u, r.get("title", "") or "")
+                    ok2 = self.process(u, r.get("title", "") or "")
                     self.seen.add(u)
-                    if ok:
+                    if ok2:
                         self.ui_event()
 
                     done += 1
@@ -937,7 +1126,7 @@ class SearchEngine:
     def process(self, url: str, title_hint: str):
         self.log("FETCH開始 " + url)
         try:
-            html, _ = fetch_html(url, int(self.s.get("fetch_timeout_sec", 25)), self.log)
+            html, _ = fetch_html(url, int(self.s.get("search_timeout_sec", 25)), self.log)
             if not html:
                 return False
 
@@ -960,38 +1149,35 @@ class SearchEngine:
             kws = []
 
             if bool(self.s.get("use_llm", True)):
-                try:
-                    obj = self.llm.summarize(self.topic, title, url, cleaned)
-                    if obj:
-                        summary = norm_ws(str(obj.get("summary_ja", "") or ""))[:sum_chars]
+                obj = self.llm.summarize(self.topic, title, url, cleaned)
+                if obj:
+                    summary = norm_ws(str(obj.get("summary_ja", "") or ""))[:sum_chars]
+                    try:
                         rel = float(obj.get("relevance", 50) or 50)
+                    except Exception:
+                        rel = 50.0
+                    try:
                         qua = float(obj.get("quality", 50) or 50)
-                        kws = obj.get("keywords", []) if isinstance(obj.get("keywords", []), list) else []
-                except Exception as e:
-                    self.log(f"LLM要約失敗 -> フォールバック: {type(e).__name__} {e}")
+                    except Exception:
+                        qua = 50.0
+                    kws = obj.get("keywords", []) if isinstance(obj.get("keywords", []), list) else []
 
             if not summary:
                 summary = extractive_summary(cleaned, sum_chars)
                 qua = quality_heuristic(url, len(cleaned))
                 rel = 50.0
 
-            # Embedding + score
-            if bool(self.s.get("rag_embed_title_summary", True)):
-                emb_text = (title or "") + "\n" + (summary or "")
-            else:
-                emb_text = summary or ""
-
+            emb_text = (title or "") + "\n" + (summary or "")
             svec = self.emb.embed([emb_text])[0]
-            topic_sim = cos(self.topic_vec, svec) * 100.0
+            topic_sim = cos(self.topic_vec, svec) * 100.0 if self.topic_vec is not None else 0.0
 
-            # relevance は LLM評価と embedding類似の混合
             rel = max(0.0, min(100.0, rel * 0.6 + topic_sim * 0.4))
             qua = max(0.0, min(100.0, float(qua) if qua is not None else quality_heuristic(url, len(cleaned))))
 
             score = float(self.s.get("w_rel", 0.65)) * rel + float(self.s.get("w_qua", 0.35)) * qua
             score = max(0.0, min(100.0, score))
 
-            did = self.store.upsert_doc(
+            did = self.db.upsert_doc(
                 url=norm_url(url),
                 domain=get_domain(url),
                 title=title,
@@ -1005,23 +1191,43 @@ class SearchEngine:
             )
             self.rag.upsert(did, svec)
 
-            # related terms（LLMのkeywordsがあれば混ぜる）
-            kw_src = title + "\n" + cleaned[:int(self.s.get("max_kw_chars", 14000))]
-            extracted = extract_keywords(kw_src, self.topic, limit=20)
-            if kws:
-                for k in kws[:12]:
-                    k = str(k).strip()
-                    if k and k not in extracted:
-                        extracted.insert(0, k)
-                extracted = extracted[:24]
+            if bool(self.s.get("use_related", True)) and self.topic:
+                kw_src = title + "\n" + cleaned[:int(self.s.get("max_kw_chars", 14000))]
+                extracted = extract_keywords(kw_src, self.topic, limit=20)
 
-            for term in extracted:
-                tvec = self.emb.embed([term])[0]
-                tsim = cos(self.topic_vec, tvec)
-                if tsim < float(self.s.get("rel_sim_threshold", 0.22)):
-                    continue
-                tscore = score * 0.55 + tsim * 100.0 * 0.45
-                self.store.upsert_related(term, tscore, url)
+                if kws:
+                    for k in kws[:12]:
+                        k = str(k).strip()
+                        if k and k not in extracted:
+                            extracted.insert(0, k)
+                    extracted = extracted[:24]
+
+                thr = float(self.s.get("rel_sim_threshold", 0.24))
+                hash_mode = (getattr(self.emb, "mode", "hash") == "hash")
+                for term in extracted:
+                    if len(term) < 2 or len(term) > 24:
+                        continue
+
+                    if hash_mode:
+                        # hash埋め込みは意味類似を表現できない（ほぼ完全一致しか拾えない）ので、
+                        # topic-term 類似度フィルタは使わず、出現頻度ベースで関連ワードを採用する
+                        cnt = kw_src.count(term)
+                        if term in title:
+                            cnt += 2
+                        fsc = min(1.0, cnt / 8.0)  # 0..1
+                        lb = min(1.0, len(term) / 10.0)
+                        kval = 40.0 + 60.0 * (0.75 * fsc + 0.25 * lb)
+                        tscore = score * 0.65 + kval * 0.35
+                        self.db.upsert_related(term, float(tscore), url)
+                        continue
+
+                    tvec = self.emb.embed([term])[0]
+                    tsim = cos(self.topic_vec, tvec)
+                    if tsim < thr:
+                        continue
+                    tscore = score * 0.50 + tsim * 100.0 * 0.50
+                    self.db.upsert_related(term, float(tscore), url)
+
 
             self.log(f"保存 score={score:.1f} rel={rel:.1f} qua={qua:.1f} url={url}")
             return True
@@ -1030,14 +1236,16 @@ class SearchEngine:
             self.log(f"ERROR url={url} type={type(e).__name__} msg={e}")
             return False
 
-# ---------------- UI ----------------
+# ==================== UI ====================
 def run():
     try:
-        os.chdir(os.path.dirname(os.path.abspath(__file__)))
-    except Exception:
-        pass
+        must_writable_dir(DATA_DIR)
+    except Exception as e:
+        sys.stderr.write("書き込み不可の場所です。フォルダをEドライブ等の書き込み可能な場所へ移動してください。\n")
+        sys.stderr.write(str(e) + "\n")
+        raise
 
-    os.makedirs("models/gpt-oss", exist_ok=True)
+    os.makedirs(GPTOSS_DIR, exist_ok=True)
 
     log_q = queue.Queue()
     ui_q = queue.Queue()
@@ -1052,20 +1260,52 @@ def run():
             pass
 
     log(f"起動: {APP} {VER}")
+
+    # 依存の版ズレを判定しやすいように、主要ライブラリのバージョンをログへ
+    try:
+        import httpx as _httpx
+        log("httpx=" + getattr(_httpx, "__version__", "unknown"))
+    except Exception:
+        pass
+    try:
+        import ddgs as _ddgs
+        log("ddgs=" + getattr(_ddgs, "__version__", "unknown"))
+    except Exception:
+        pass
+    try:
+        import bs4 as _bs4
+        log("bs4=" + getattr(_bs4, "__version__", "unknown"))
+    except Exception:
+        pass
+
     log(f"runtime log: {os.path.abspath(LOG_PATH)}")
+    log("data root: " + os.path.abspath(DATA_DIR))
 
     s = load_settings()
-    store = Store(DB_PATH)
+    # 起動時モデルDLはUIのインストール画面で実行（ブロック）
+
+    db = DB(DB_PATH)
     emb = Embedder(s, log)
-    rag = RagIndex(emb.dim)
-    rag.rebuild(store)
+
+    # 埋め込みがhashの場合、関連ワードのcos類似しきい値が高いと拾いづらい。
+    # settings.jsonがデフォルトのままなら、hash向けの値に自動調整する。
+    try:
+        if getattr(emb, "mode", "hash") == "hash":
+            if float(s.get("rel_sim_threshold", DEFAULT["rel_sim_threshold"])) == float(DEFAULT["rel_sim_threshold"]):
+                s["rel_sim_threshold"] = float(s.get("rel_sim_threshold_hash_default", DEFAULT.get("rel_sim_threshold_hash_default", 0.12)))
+                save_settings(s)
+                log(f"rel_sim_threshold(auto)= {s['rel_sim_threshold']:.2f}")
+    except Exception:
+        pass
+    rag = RagMem(emb.dim)
+    rag.rebuild(db)
 
     import tkinter as tk
     from tkinter import ttk, messagebox, filedialog
 
     root = tk.Tk()
     root.title(f"{APP} {VER}")
-    root.geometry("1200x820")
+    root.geometry("1180x780")
 
     status = tk.StringVar(value="Ready")
 
@@ -1074,8 +1314,7 @@ def run():
 
     def refresh():
         ui_q.put(("refresh", None))
-
-    engine = SearchEngine(store, s, emb, rag, log, refresh, set_status)
+    engine = Engine(db, s, emb, rag, log, refresh, set_status)
 
     top = ttk.Frame(root, padding=8)
     top.pack(side=tk.TOP, fill=tk.X)
@@ -1103,6 +1342,13 @@ def run():
     ttk.Button(top, text="topic設定", command=set_topic).pack(side=tk.LEFT, padx=4)
 
     def start():
+
+        if not preflight.get('ok', False):
+
+            _show_installer_and_run()
+
+            return
+
         if not engine.topic:
             t = topic_var.get().strip()
             if not t:
@@ -1115,27 +1361,216 @@ def run():
         engine.halt()
         log("Research stop requested")
 
-    ttk.Button(top, text="開始", command=start).pack(side=tk.LEFT, padx=4)
-    ttk.Button(top, text="停止", command=stop).pack(side=tk.LEFT, padx=4)
+    start_btn = ttk.Button(top, text="開始", command=start)
+    start_btn.pack(side=tk.LEFT, padx=4)
+    stop_btn = ttk.Button(top, text="停止", command=stop)
+    stop_btn.pack(side=tk.LEFT, padx=4)
+    ttk.Label(top, textvariable=status).pack(side=tk.RIGHT)
+    # ---------- startup installer (pip + GPT-OSS) ----------
+    preflight = {"done": False, "ok": False, "running": False}
 
-    ttk.Label(top, text="RAG閾値").pack(side=tk.LEFT, padx=(18, 4))
-    rag_min_var = tk.StringVar(value=str(s.get("rag_min_sim", 0.28)))
+    def _show_installer_and_run():
+        if preflight["running"] or preflight["done"]:
+            return
 
-    def apply_rag_min():
+        preflight["running"] = True
         try:
-            v = float(rag_min_var.get().strip())
-            v = max(0.0, min(0.99, v))
-            s["rag_min_sim"] = v
-            save_settings(s)
-            log(f"rag_min_sim={v:.3f}")
+            start_btn.state(["disabled"])
         except Exception:
             pass
 
-    e_min = ttk.Entry(top, textvariable=rag_min_var, width=8)
-    e_min.pack(side=tk.LEFT)
-    ttk.Button(top, text="反映", command=apply_rag_min).pack(side=tk.LEFT, padx=4)
+        dlg = tk.Toplevel(root)
+        dlg.title("インストール")
+        dlg.geometry("560x260")
+        dlg.resizable(False, False)
+        dlg.transient(root)
+        dlg.grab_set()
 
-    ttk.Label(top, textvariable=status).pack(side=tk.RIGHT)
+        # 途中で閉じられると中途半端になるので基本は無効化
+        dlg.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        msg_var = tk.StringVar(value="準備中...")
+        ttk.Label(dlg, textvariable=msg_var, wraplength=540, justify="left").pack(anchor="w", padx=12, pady=(12, 6))
+
+        pbar = ttk.Progressbar(dlg, orient="horizontal", mode="determinate", maximum=100)
+        pbar.pack(fill=tk.X, padx=12, pady=(0, 8))
+
+        logtxt = tk.Text(dlg, height=7, wrap=tk.WORD)
+        logtxt.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 10))
+        logtxt.configure(state="disabled")
+
+        btn_row = ttk.Frame(dlg)
+        btn_row.pack(fill=tk.X, padx=12, pady=(0, 10))
+        close_btn = ttk.Button(btn_row, text="閉じる", command=lambda: (dlg.grab_release(), dlg.destroy()))
+        close_btn.pack(side=tk.RIGHT)
+        close_btn.state(["disabled"])
+
+        qinst = queue.Queue()
+
+        def inst_log(line: str):
+            try:
+                qinst.put(("log", line))
+            except Exception:
+                pass
+
+        def _download_file(url: str, dst: str):
+            import httpx
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            tmp = dst + ".part"
+
+            exist = 0
+            if os.path.exists(tmp):
+                try:
+                    exist = os.path.getsize(tmp)
+                except Exception:
+                    exist = 0
+
+            headers = {"User-Agent": "Mozilla/5.0 Zunkey_GPT_Search"}
+            if exist > 0:
+                headers["Range"] = f"bytes={exist}-"
+
+            t0 = time.time()
+            last = 0.0
+            got = exist
+
+            with httpx.Client(follow_redirects=True, timeout=None, headers=headers) as c:
+                with c.stream("GET", url) as r:
+                    r.raise_for_status()
+
+                    total = 0
+                    cr = r.headers.get("content-range") or r.headers.get("Content-Range") or ""
+                    if "/" in cr:
+                        try:
+                            total = int(cr.split("/")[-1])
+                        except Exception:
+                            total = 0
+                    if total <= 0:
+                        try:
+                            total = int(r.headers.get("content-length") or 0) + exist
+                        except Exception:
+                            total = 0
+
+                    mode = "ab" if exist > 0 else "wb"
+                    with open(tmp, mode) as f:
+                        for ch in r.iter_bytes(chunk_size=1024 * 1024):
+                            if not ch:
+                                continue
+                            f.write(ch)
+                            got += len(ch)
+
+                            now = time.time()
+                            if now - last < 0.15:
+                                continue
+                            last = now
+
+                            if total > 0:
+                                pct = max(0.0, min(100.0, got * 100.0 / total))
+                                sec = max(0.001, now - t0)
+                                sp = got / sec / (1024 * 1024)
+                                qinst.put(("progress", pct))
+                                qinst.put(("msg", f"GPT-OSS ダウンロード中... {pct:.1f}%  {got/1e9:.2f}GB/{total/1e9:.2f}GB  {sp:.1f}MB/s"))
+                            else:
+                                qinst.put(("progress", 0.0))
+                                qinst.put(("msg", f"GPT-OSS ダウンロード中... {got/1e9:.2f}GB"))
+
+            os.replace(tmp, dst)
+
+        def worker():
+            try:
+                qinst.put(("msg", "必須パッケージ確認中..."))
+                ok = ensure_packages(inst_log)
+                if not ok:
+                    qinst.put(("error", "必須パッケージが不足しています（EXEは同梱が必要です）。"))
+                    return
+
+                qinst.put(("msg", "GPT-OSS モデル確認中..."))
+                model_path = resolve_in_data(s.get("llm_model_path", ""))
+                model_url = (s.get("llm_model_url", "") or "").strip()
+
+                if not model_path:
+                    qinst.put(("error", "llm_model_path が空です。"))
+                    return
+
+                os.makedirs(os.path.dirname(model_path), exist_ok=True)
+
+                if os.path.exists(model_path) and os.path.getsize(model_path) > 1024 * 1024:
+                    qinst.put(("progress", 100.0))
+                    qinst.put(("msg", "GPT-OSS 既に存在します。"))
+                else:
+                    if not model_url:
+                        qinst.put(("error", "llm_model_url が空のため自動ダウンロードできません。"))
+                        return
+                    qinst.put(("progress", 0.0))
+                    qinst.put(("log", f"download start: {model_path}"))
+                    _download_file(model_url, model_path)
+                    qinst.put(("progress", 100.0))
+                    qinst.put(("msg", "GPT-OSS ダウンロード完了。"))
+
+                qinst.put(("done", None))
+            except Exception as e:
+                qinst.put(("error", f"{type(e).__name__}: {e}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        def tick():
+            try:
+                while True:
+                    kind, payload = qinst.get_nowait()
+                    if kind == "msg":
+                        msg_var.set(str(payload))
+                    elif kind == "progress":
+                        try:
+                            pbar.configure(value=float(payload))
+                        except Exception:
+                            pass
+                    elif kind == "log":
+                        logtxt.configure(state="normal")
+                        logtxt.insert("end", str(payload) + "\n")
+                        logtxt.see("end")
+                        logtxt.configure(state="disabled")
+                    elif kind == "error":
+                        msg_var.set("失敗: " + str(payload))
+                        logtxt.configure(state="normal")
+                        logtxt.insert("end", "ERROR: " + str(payload) + "\n")
+                        logtxt.see("end")
+                        logtxt.configure(state="disabled")
+                        close_btn.state(["!disabled"])
+                        preflight["done"] = True
+                        preflight["ok"] = False
+                        preflight["running"] = False
+                        return
+                    elif kind == "done":
+                        preflight["done"] = True
+                        preflight["ok"] = True
+                        preflight["running"] = False
+                        try:
+                            start_btn.state(["!disabled"])
+                        except Exception:
+                            pass
+                        try:
+                            dlg.protocol("WM_DELETE_WINDOW", lambda: (dlg.grab_release(), dlg.destroy()))
+                        except Exception:
+                            pass
+                        try:
+                            dlg.grab_release()
+                        except Exception:
+                            pass
+                        dlg.destroy()
+                        return
+            except queue.Empty:
+                pass
+
+            root.after(120, tick)
+
+        tick()
+
+    # 起動直後に必ずインストール画面（モデルDL含む）を走らせる
+    try:
+        start_btn.state(["disabled"])
+    except Exception:
+        pass
+    root.after(150, _show_installer_and_run)
+
 
     pan = ttk.PanedWindow(root, orient=tk.HORIZONTAL)
     pan.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -1178,7 +1613,7 @@ def run():
             return messagebox.showinfo("info", "記事が選択されていません")
         if not messagebox.askyesno("confirm", "選択した記事を削除しますか"):
             return
-        url = store.delete_doc(int(did))
+        url = db.delete_doc(int(did))
         rag.remove(int(did))
         log(f"記事削除 id={did} url={url}")
         refresh()
@@ -1186,7 +1621,7 @@ def run():
     def delete_doc_all():
         if not messagebox.askyesno("confirm", "全記事を削除しますか（取り消し不可）"):
             return
-        store.delete_all_docs()
+        db.delete_all_docs()
         rag.clear()
         engine.seen.clear()
         log("全記事削除")
@@ -1198,19 +1633,19 @@ def run():
             return messagebox.showinfo("info", "キーワードが選択されていません")
         if not messagebox.askyesno("confirm", f"キーワード「{term}」を削除しますか"):
             return
-        store.delete_related(term)
+        db.delete_related(term)
         log("キーワード削除: " + term)
         refresh()
 
     def delete_kw_all():
         if not messagebox.askyesno("confirm", "全キーワードを削除しますか（取り消し不可）"):
             return
-        store.delete_all_related()
+        db.delete_all_related()
         log("全キーワード削除")
         refresh()
 
     def export_all_text():
-        rows = store.list_docs_full()
+        rows = db.list_docs_full()
         if not rows:
             return messagebox.showinfo("info", "エクスポートする記事がありません")
 
@@ -1253,6 +1688,9 @@ def run():
             log(f"エクスポート失敗 {type(e).__name__}: {e}")
             messagebox.showerror("error", f"エクスポートに失敗しました\n{e}")
 
+    import tkinter as tk
+    from tkinter import ttk
+
     ttk.Button(act, text="記事削除", command=delete_doc_selected).pack(side="left", padx=4)
     ttk.Button(act, text="全記事削除", command=delete_doc_all).pack(side="left", padx=4)
     ttk.Button(act, text="キーワード削除", command=delete_kw_selected).pack(side="left", padx=4)
@@ -1265,38 +1703,129 @@ def run():
 
     ttk.Label(rt, text="RAG検索").pack(side=tk.LEFT)
     qv = tk.StringVar()
-    ttk.Entry(rt, textvariable=qv, width=48).pack(side=tk.LEFT, padx=6)
+    ttk.Entry(rt, textvariable=qv, width=44).pack(side=tk.LEFT, padx=6)
 
-    rag_list = tk.Listbox(right, height=7)
+    # RAGしきい値（厳しさ）: スライダーで範囲固定＆数値バグ回避（settings.jsonにも保存）
+    rt2 = ttk.Frame(right)
+    rt2.pack(fill=tk.X, pady=(2, 2))
+
+    rag_thr_var = tk.DoubleVar(value=float(s.get("rag_min_sim", 0.22)))
+    ttk.Label(rt2, text="しきい値").pack(side=tk.LEFT)
+
+    rag_thr_val = tk.StringVar(value=f"{float(rag_thr_var.get()):.2f}")
+    ttk.Label(rt2, textvariable=rag_thr_val, width=4).pack(side=tk.LEFT, padx=(6, 6))
+
+    def _rag_thr_changed(v):
+        try:
+            fv = float(v)
+        except Exception:
+            return
+        fv = max(0.05, min(0.40, round(fv, 2)))
+        rag_thr_val.set(f"{fv:.2f}")
+
+    rag_thr = tk.Scale(
+        rt2,
+        from_=0.05,
+        to=0.40,
+        resolution=0.01,
+        orient="horizontal",
+        length=240,
+        showvalue=False,
+        variable=rag_thr_var,
+        command=_rag_thr_changed
+    )
+    rag_thr.pack(side=tk.LEFT, padx=(0, 8))
+
+    def _save_rag_thr_event(_evt=None):
+        try:
+            fv = float(rag_thr_var.get())
+            fv = max(0.05, min(0.40, round(fv, 2)))
+            rag_thr_var.set(fv)
+            rag_thr_val.set(f"{fv:.2f}")
+            s["rag_min_sim"] = fv
+            save_settings(s)
+        except Exception:
+            pass
+
+    rag_thr.bind("<ButtonRelease-1>", _save_rag_thr_event)
+    rag_thr.bind("<KeyRelease-Left>", _save_rag_thr_event)
+    rag_thr.bind("<KeyRelease-Right>", _save_rag_thr_event)
+
+    # 関連ワード しきい値（低いほど拾う）: 数値入力ではなくスライダーで保存
+    rt3 = ttk.Frame(right)
+    rt3.pack(fill=tk.X, pady=(0, 6))
+
+    rel_thr_var = tk.DoubleVar(value=float(s.get("rel_sim_threshold", DEFAULT.get("rel_sim_threshold", 0.22))))
+    ttk.Label(rt3, text="関連しきい値").pack(side=tk.LEFT)
+
+    rel_thr_val = tk.StringVar(value=f"{float(rel_thr_var.get()):.2f}")
+    ttk.Label(rt3, textvariable=rel_thr_val, width=4).pack(side=tk.LEFT, padx=(6, 6))
+
+    def _rel_thr_changed(v):
+        try:
+            fv = float(v)
+        except Exception:
+            return
+        fv = max(0.05, min(0.35, round(fv, 2)))
+        rel_thr_val.set(f"{fv:.2f}")
+
+    rel_thr = tk.Scale(
+        rt3,
+        from_=0.05,
+        to=0.35,
+        resolution=0.01,
+        orient="horizontal",
+        length=240,
+        showvalue=False,
+        variable=rel_thr_var,
+        command=_rel_thr_changed
+    )
+    rel_thr.pack(side=tk.LEFT, padx=(0, 8))
+
+    def _save_rel_thr_event(_evt=None):
+        try:
+            fv = float(rel_thr_var.get())
+            fv = max(0.05, min(0.35, round(fv, 2)))
+            rel_thr_var.set(fv)
+            rel_thr_val.set(f"{fv:.2f}")
+            s["rel_sim_threshold"] = fv
+            save_settings(s)
+        except Exception:
+            pass
+
+    rel_thr.bind("<ButtonRelease-1>", _save_rel_thr_event)
+    rel_thr.bind("<KeyRelease-Left>", _save_rel_thr_event)
+    rel_thr.bind("<KeyRelease-Right>", _save_rel_thr_event)
+
+
+
+    rag_list = tk.Listbox(right, height=6)
     rag_list.pack(fill=tk.X)
 
     def do_rag():
         q = qv.get().strip()
-        if not q or len(q) < 2:
+        if not q:
             return
-
         qvec = emb.embed([q])[0]
-        topk = int(s.get("rag_topk", 8))
-        try:
-            min_sim = float(s.get("rag_min_sim", 0.28))
-        except Exception:
-            min_sim = 0.28
-
-        hits = rag.search(qvec, topk=topk, min_sim=min_sim)
+        hits = rag.search(qvec, topk=int(s.get("rag_topk", 8)))
 
         rag_list.delete(0, tk.END)
         rag_map.clear()
 
-        if not hits:
-            rag_list.insert(tk.END, f"一致なし（sim >= {min_sim:.2f}）")
-            return
-
-        for i, (did, sim) in enumerate(hits):
-            doc = store.get_doc(did)
+        min_sim = float(s.get("rag_min_sim", 0.24))
+        i = 0
+        for did, sim in hits:
+            if sim < min_sim:
+                continue
+            doc = db.get_doc(did)
             if not doc:
                 continue
-            rag_list.insert(tk.END, f"{sim*100:.1f} | {clamp(doc.get('title',''),80)}")
+            rag_list.insert(tk.END, f"{sim*100:.1f} | {clamp(doc.get('title',''),70)}")
             rag_map[i] = did
+            i += 1
+
+        if i == 0:
+            rag_list.insert(tk.END, "該当なし（しきい値で除外）")
 
     ttk.Button(rt, text="検索", command=do_rag).pack(side=tk.LEFT)
 
@@ -1338,18 +1867,18 @@ def run():
     def refresh_lists():
         doc_map.clear()
         docs.delete(0, tk.END)
-        for i, (did, score, relv, quav, title, url, created) in enumerate(store.list_docs(limit=300)):
+        for i, (did, score, relv, quav, title, url, created) in enumerate(db.list_docs(limit=300)):
             docs.insert(tk.END, f"{float(score):5.1f} r{float(relv):4.1f} q{float(quav):4.1f} | {clamp(title,60)}")
             doc_map[i] = int(did)
 
         rel_map.clear()
         rel.delete(0, tk.END)
-        for i, (term, score, last_seen, src) in enumerate(store.list_related(limit=200)):
-            rel.insert(tk.END, f"{float(score):5.1f} | {term}")
+        for i, (term, score, hits, last_seen, src) in enumerate(db.list_related(limit=int(s.get("related_limit", 200)))):
+            rel.insert(tk.END, f"{float(score):5.1f} h{int(hits):3d} | {term}")
             rel_map[i] = str(term)
 
     def show_doc(did: int):
-        d = store.get_doc(did)
+        d = db.get_doc(did)
         cur_doc["doc"] = d
         if not d:
             return
@@ -1362,7 +1891,7 @@ def run():
         txt.delete("1.0", "end")
         txt.insert("end", (d.get("summary", "") or "").strip() + "\n\n")
         txt.insert("end", "---- cleaned text（先頭） ----\n")
-        txt.insert("end", clamp(d.get("cleaned", "") or "", 5200))
+        txt.insert("end", clamp(d.get("cleaned", "") or "", 4200))
 
     def on_docs(_=None):
         sel = docs.curselection()
@@ -1385,7 +1914,6 @@ def run():
     rag_list.bind("<<ListboxSelect>>", on_rag)
 
     def ui_tick():
-        # UI event queue
         try:
             while True:
                 ev, payload = ui_q.get_nowait()
@@ -1396,7 +1924,6 @@ def run():
         except queue.Empty:
             pass
 
-        # log queue
         try:
             while True:
                 line = log_q.get_nowait()
