@@ -145,6 +145,11 @@ def norm_ws(s: str) -> str:
 def sha1(s: str) -> str:
     return hashlib.sha1((s or "").encode("utf-8", "ignore")).hexdigest()
 
+def stable_hash32(s: str) -> int:
+    """Stable 32-bit hash for fallback embeddings (avoid Python's randomized hash())."""
+    b = hashlib.blake2b((s or "").encode("utf-8", "ignore"), digest_size=4).digest()
+    return int.from_bytes(b, "little", signed=False)
+
 def norm_url(u: str) -> str:
     try:
         p = urllib.parse.urlsplit(u)
@@ -155,7 +160,18 @@ def norm_url(u: str) -> str:
 
 def get_domain(u: str) -> str:
     try:
-        return urllib.parse.urlparse(u).netloc.lower()
+        netloc = urllib.parse.urlparse(u).netloc.lower()
+        if not netloc:
+            return ""
+        if "@" in netloc:
+            netloc = netloc.split("@", 1)[1]
+        if netloc.startswith("["):
+            host = netloc.split("]")[0] + "]"
+        else:
+            host = netloc.split(":", 1)[0]
+        if host.startswith("www."):
+            host = host[4:]
+        return host
     except Exception:
         return ""
 
@@ -469,7 +485,7 @@ class Embedder:
             for w in tokenize(t):
                 if w in STOP:
                     continue
-                v[(hash(w) & 0x7fffffff) % self.dim] += 1.0
+                v[stable_hash32(w) % self.dim] += 1.0
             n = float(np.linalg.norm(v))
             if n > 0:
                 v /= n
@@ -566,7 +582,7 @@ def ddg_search(query, s, log):
 
     # Nuitka等で凍結（frozen）された実行環境では、ddgs側がブロック/仕様変更で落ちやすいことがある。
     # その場合はHTML版を直接パースする方式を優先する。
-    if bool(s.get("force_html_search_when_frozen", True)) and bool(getattr(sys, "frozen", False)):
+    if bool(s.get("force_html_search_when_frozen", True)) and is_frozen_app():
         try:
             return ddg_html_search(query, s, log)
         except Exception as e:
@@ -1100,9 +1116,10 @@ class Engine:
                         continue
                     if u in self.seen:
                         continue
-
                     d = get_domain(u)
-                    if d in (self.s.get("avoid_domains", []) or []):
+                    avoid = [a.lower() for a in (self.s.get("avoid_domains", []) or []) if a]
+                    avoid = [(a[4:] if a.startswith("www.") else a) for a in avoid]
+                    if d and any((d == a) or d.endswith("." + a) for a in avoid):
                         continue
 
                     ok2 = self.process(u, r.get("title", "") or "")
