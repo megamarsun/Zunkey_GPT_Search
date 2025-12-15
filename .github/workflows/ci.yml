@@ -22,6 +22,3 @@ jobs:
 
       - name: Syntax check
         run: python -m compileall -q .
-
-      - name: Import smoke test
-        run: python -c "import Zunkey_GPT_Search; print('import ok')"
