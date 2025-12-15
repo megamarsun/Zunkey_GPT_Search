@@ -5,7 +5,7 @@ on:
   pull_request:
 
 jobs:
-  ruff:
+  lint-and-smoke:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,6 +17,11 @@ jobs:
       - name: Install ruff
         run: python -m pip install --upgrade pip ruff
 
-      - name: Lint
-        run: ruff check . --exit-zero
+      - name: Ruff
+        run: ruff check .
 
+      - name: Syntax check
+        run: python -m compileall -q .
+
+      - name: Import smoke test
+        run: python -c "import Zunkey_GPT_Search; print('import ok')"
