@@ -1378,10 +1378,56 @@ def run():
         engine.halt()
         log("Research stop requested")
 
+    def export_all_text():
+        rows = db.list_docs_full()
+        if not rows:
+            return messagebox.showinfo("info", "エクスポートする記事がありません")
+
+        default_name = f"zunkey_gpt_search_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        path = filedialog.asksaveasfilename(
+            title="エクスポート先を選択",
+            defaultextension=".txt",
+            initialfile=default_name,
+            filetypes=[("Text", "*.txt"), ("All", "*.*")]
+        )
+        if not path:
+            return
+
+        sep = "=" * 80
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"{APP} export {VER}\n")
+                f.write(f"topic: {s.get('topic','')}\n")
+                f.write(f"exported_at: {iso_utc()}\n")
+                f.write(sep + "\n\n")
+
+                for (did, url, dom, title, summary, cleaned, created_at, relevance, quality, score) in rows:
+                    f.write(sep + "\n")
+                    f.write(f"id: {did}\n")
+                    f.write(f"score: {float(score):.1f}  rel: {float(relevance):.1f}  qua: {float(quality):.1f}\n")
+                    f.write(f"created_at: {created_at}\n")
+                    f.write(f"domain: {dom}\n")
+                    f.write(f"title: {title}\n")
+                    f.write(f"url: {url}\n\n")
+
+                    f.write("【summary】\n")
+                    f.write((summary or "").strip() + "\n\n")
+
+                    f.write("【cleaned】\n")
+                    f.write((cleaned or "").strip() + "\n\n")
+
+            log("エクスポート完了: " + os.path.abspath(path))
+            messagebox.showinfo("info", "エクスポート完了")
+        except Exception as e:
+            log(f"エクスポート失敗 {type(e).__name__}: {e}")
+            messagebox.showerror("error", f"エクスポートに失敗しました\n{e}")
+
     start_btn = ttk.Button(top, text="開始", command=start)
     start_btn.pack(side=tk.LEFT, padx=4)
     stop_btn = ttk.Button(top, text="停止", command=stop)
     stop_btn.pack(side=tk.LEFT, padx=4)
+    export_btn = ttk.Button(top, text="全記事エクスポート", command=export_all_text)
+    export_btn.pack(side=tk.LEFT, padx=(12,4))
     ttk.Label(top, textvariable=status).pack(side=tk.RIGHT)
     # ---------- startup installer (pip + GPT-OSS) ----------
     preflight = {"done": False, "ok": False, "running": False}
@@ -1598,15 +1644,65 @@ def run():
     pan.add(right, weight=2)
 
     ttk.Label(left, text="収集ドキュメント（score順）").pack(anchor="w")
-    docs = tk.Listbox(left, height=16)
+    docs = tk.Listbox(left, height=16, selectmode=tk.EXTENDED, exportselection=False)
     docs.pack(fill=tk.BOTH, expand=False)
 
+    # Doc actions (under docs list)
+    doc_act = ttk.Frame(left)
+    doc_act.pack(fill=tk.X, pady=(4, 0))
+
     ttk.Label(left, text="関連ワード（ランキング）").pack(anchor="w", pady=(10, 0))
-    rel = tk.Listbox(left, height=12)
+    rel = tk.Listbox(left, height=12, selectmode=tk.EXTENDED, exportselection=False)
     rel.pack(fill=tk.BOTH, expand=True)
 
-    act = ttk.LabelFrame(left, text="操作", padding=6)
-    act.pack(fill=tk.X, pady=8)
+    # 関連語採用の厳しさ（関連ワードの直下に配置）
+    rel_thr_row = ttk.Frame(left)
+    rel_thr_row.pack(fill=tk.X, pady=(4, 6))
+
+    rel_thr_var = tk.DoubleVar(value=float(s.get("rel_sim_threshold", DEFAULT.get("rel_sim_threshold", 0.18))))
+    ttk.Label(rel_thr_row, text="関連語採用の厳しさ").pack(side=tk.LEFT)
+
+    rel_thr_val = tk.StringVar(value=f"{float(rel_thr_var.get()):.2f}")
+    ttk.Label(rel_thr_row, textvariable=rel_thr_val, width=4).pack(side=tk.LEFT, padx=(6, 6))
+
+    def _rel_thr_changed(v):
+        try:
+            fv = float(v)
+        except Exception:
+            return
+        fv = max(0.05, min(0.35, round(fv, 2)))
+        rel_thr_val.set(f"{fv:.2f}")
+
+    def _save_rel_thr_event(_evt=None):
+        try:
+            fv = float(rel_thr_var.get())
+            fv = max(0.05, min(0.35, round(fv, 2)))
+            rel_thr_var.set(fv)
+            rel_thr_val.set(f"{fv:.2f}")
+            s["rel_sim_threshold"] = fv
+            save_settings(s)
+        except Exception:
+            pass
+
+    rel_thr = tk.Scale(
+        rel_thr_row,
+        from_=0.05,
+        to=0.35,
+        resolution=0.01,
+        orient="horizontal",
+        length=220,
+        showvalue=False,
+        variable=rel_thr_var,
+        command=_rel_thr_changed,
+    )
+    rel_thr.pack(side=tk.LEFT, padx=(0, 0), fill=tk.X, expand=True)
+
+    rel_thr.bind("<ButtonRelease-1>", _save_rel_thr_event)
+    rel_thr.bind("<KeyRelease-Left>", _save_rel_thr_event)
+    rel_thr.bind("<KeyRelease-Right>", _save_rel_thr_event)
+
+    act = ttk.Frame(left)
+    act.pack(fill=tk.X, pady=(4, 0))
 
     doc_map = {}
     rel_map = {}
@@ -1624,16 +1720,64 @@ def run():
             return None
         return rel_map.get(sel[0])
 
+    def get_selected_doc_ids():
+        sels = docs.curselection()
+        out = []
+        seen = set()
+        for i in sels:
+            did = doc_map.get(i)
+            if did is None:
+                continue
+            try:
+                did_i = int(did)
+            except Exception:
+                continue
+            if did_i in seen:
+                continue
+            seen.add(did_i)
+            out.append(did_i)
+        return out
+
+    def get_selected_terms():
+        sels = rel.curselection()
+        out = []
+        seen = set()
+        for i in sels:
+            term = rel_map.get(i)
+            if not term:
+                continue
+            if term in seen:
+                continue
+            seen.add(term)
+            out.append(term)
+        return out
+
+
     def delete_doc_selected():
-        did = get_selected_doc_id()
-        if not did:
+        ids = get_selected_doc_ids()
+        if not ids:
             return messagebox.showinfo("info", "記事が選択されていません")
-        if not messagebox.askyesno("confirm", "選択した記事を削除しますか"):
+
+        msg = "選択した記事を削除しますか" if len(ids) == 1 else f"選択した{len(ids)}件の記事を削除しますか"
+        if not messagebox.askyesno("confirm", msg):
             return
-        url = db.delete_doc(int(did))
-        rag.remove(int(did))
-        log(f"記事削除 id={did} url={url}")
+
+        for did in ids:
+            url = None
+            try:
+                url = db.delete_doc(int(did))
+            except Exception:
+                pass
+            try:
+                rag.remove(int(did))
+            except Exception:
+                pass
+            if url:
+                log(f"記事削除 id={did} url={url}")
+            else:
+                log(f"記事削除 id={did}")
         refresh()
+
 
     def delete_doc_all():
         if not messagebox.askyesno("confirm", "全記事を削除しますか（取り消し不可）"):
@@ -1645,14 +1789,25 @@ def run():
         refresh()
 
     def delete_kw_selected():
-        term = get_selected_term()
-        if not term:
+        terms = get_selected_terms()
+        if not terms:
             return messagebox.showinfo("info", "キーワードが選択されていません")
-        if not messagebox.askyesno("confirm", f"キーワード「{term}」を削除しますか"):
+
+        if len(terms) == 1:
+            msg = f"キーワード「{terms[0]}」を削除しますか"
+        else:
+            msg = f"選択した{len(terms)}個のキーワードを削除しますか"
+        if not messagebox.askyesno("confirm", msg):
             return
-        db.delete_related(term)
-        log("キーワード削除: " + term)
+
+        for term in terms:
+            try:
+                db.delete_related(term)
+            except Exception:
+                pass
+            log("キーワード削除: " + str(term))
         refresh()
+
 
     def delete_kw_all():
         if not messagebox.askyesno("confirm", "全キーワードを削除しますか（取り消し不可）"):
@@ -1661,76 +1816,34 @@ def run():
         log("全キーワード削除")
         refresh()
 
-    def export_all_text():
-        rows = db.list_docs_full()
-        if not rows:
-            return messagebox.showinfo("info", "エクスポートする記事がありません")
-
-        default_name = f"zunkey_gpt_search_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        path = filedialog.asksaveasfilename(
-            title="エクスポート先を選択",
-            defaultextension=".txt",
-            initialfile=default_name,
-            filetypes=[("Text", "*.txt"), ("All", "*.*")]
-        )
-        if not path:
-            return
-
-        sep = "=" * 80
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(f"{APP} export {VER}\n")
-                f.write(f"topic: {s.get('topic','')}\n")
-                f.write(f"exported_at: {iso_utc()}\n")
-                f.write(sep + "\n\n")
-
-                for (did, url, dom, title, summary, cleaned, created_at, relevance, quality, score) in rows:
-                    f.write(sep + "\n")
-                    f.write(f"id: {did}\n")
-                    f.write(f"score: {float(score):.1f}  rel: {float(relevance):.1f}  qua: {float(quality):.1f}\n")
-                    f.write(f"created_at: {created_at}\n")
-                    f.write(f"domain: {dom}\n")
-                    f.write(f"title: {title}\n")
-                    f.write(f"url: {url}\n\n")
-
-                    f.write("【summary】\n")
-                    f.write((summary or "").strip() + "\n\n")
-
-                    f.write("【cleaned】\n")
-                    f.write((cleaned or "").strip() + "\n\n")
-
-            log("エクスポート完了: " + os.path.abspath(path))
-            messagebox.showinfo("info", "エクスポート完了")
-        except Exception as e:
-            log(f"エクスポート失敗 {type(e).__name__}: {e}")
-            messagebox.showerror("error", f"エクスポートに失敗しました\n{e}")
-
+    
     import tkinter as tk
     from tkinter import ttk
-
-    ttk.Button(act, text="記事削除", command=delete_doc_selected).pack(side="left", padx=4)
-    ttk.Button(act, text="全記事削除", command=delete_doc_all).pack(side="left", padx=4)
+    ttk.Button(doc_act, text="記事削除", command=delete_doc_selected).pack(side="left", padx=4)
+    ttk.Button(doc_act, text="全記事削除", command=delete_doc_all).pack(side="left", padx=4)
     ttk.Button(act, text="キーワード削除", command=delete_kw_selected).pack(side="left", padx=4)
     ttk.Button(act, text="全キーワード削除", command=delete_kw_all).pack(side="left", padx=4)
-    ttk.Button(act, text="全記事エクスポート", command=export_all_text).pack(side="left", padx=4)
 
-    # Right panel: RAG search
+        # Right panel: RAG search
     rt = ttk.Frame(right)
     rt.pack(fill=tk.X)
 
     ttk.Label(rt, text="RAG検索").pack(side=tk.LEFT)
-    qv = tk.StringVar()
-    ttk.Entry(rt, textvariable=qv, width=44).pack(side=tk.LEFT, padx=6)
 
-    # RAGしきい値（厳しさ）: スライダーで範囲固定＆数値バグ回避（settings.jsonにも保存）
-    rt2 = ttk.Frame(right)
-    rt2.pack(fill=tk.X, pady=(2, 2))
+    qv = tk.StringVar()
+    rag_entry = ttk.Entry(rt, textvariable=qv, width=44)
+    rag_entry.pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
+
+    # RAGしきい値（厳しさ）
+
+    rag_thr_row = ttk.Frame(right)
+    rag_thr_row.pack(fill=tk.X, pady=(2, 2))
 
     rag_thr_var = tk.DoubleVar(value=float(s.get("rag_min_sim", 0.22)))
-    ttk.Label(rt2, text="しきい値").pack(side=tk.LEFT)
+    ttk.Label(rag_thr_row, text="RAG一致の厳しさ").pack(side=tk.LEFT)
 
     rag_thr_val = tk.StringVar(value=f"{float(rag_thr_var.get()):.2f}")
-    ttk.Label(rt2, textvariable=rag_thr_val, width=4).pack(side=tk.LEFT, padx=(6, 6))
+    ttk.Label(rag_thr_row, textvariable=rag_thr_val, width=4).pack(side=tk.LEFT, padx=(6, 6))
 
     def _rag_thr_changed(v):
         try:
@@ -1739,19 +1852,6 @@ def run():
             return
         fv = max(0.05, min(0.40, round(fv, 2)))
         rag_thr_val.set(f"{fv:.2f}")
-
-    rag_thr = tk.Scale(
-        rt2,
-        from_=0.05,
-        to=0.40,
-        resolution=0.01,
-        orient="horizontal",
-        length=240,
-        showvalue=False,
-        variable=rag_thr_var,
-        command=_rag_thr_changed
-    )
-    rag_thr.pack(side=tk.LEFT, padx=(0, 8))
 
     def _save_rag_thr_event(_evt=None):
         try:
@@ -1764,60 +1864,27 @@ def run():
         except Exception:
             pass
 
-    rag_thr.bind("<ButtonRelease-1>", _save_rag_thr_event)
-    rag_thr.bind("<KeyRelease-Left>", _save_rag_thr_event)
-    rag_thr.bind("<KeyRelease-Right>", _save_rag_thr_event)
-
-    # 関連ワード しきい値（低いほど拾う）: 数値入力ではなくスライダーで保存
-    rt3 = ttk.Frame(right)
-    rt3.pack(fill=tk.X, pady=(0, 6))
-
-    rel_thr_var = tk.DoubleVar(value=float(s.get("rel_sim_threshold", DEFAULT.get("rel_sim_threshold", 0.22))))
-    ttk.Label(rt3, text="関連しきい値").pack(side=tk.LEFT)
-
-    rel_thr_val = tk.StringVar(value=f"{float(rel_thr_var.get()):.2f}")
-    ttk.Label(rt3, textvariable=rel_thr_val, width=4).pack(side=tk.LEFT, padx=(6, 6))
-
-    def _rel_thr_changed(v):
-        try:
-            fv = float(v)
-        except Exception:
-            return
-        fv = max(0.05, min(0.35, round(fv, 2)))
-        rel_thr_val.set(f"{fv:.2f}")
-
-    rel_thr = tk.Scale(
-        rt3,
+    rag_thr = tk.Scale(
+        rag_thr_row,
         from_=0.05,
-        to=0.35,
+        to=0.40,
         resolution=0.01,
         orient="horizontal",
         length=240,
         showvalue=False,
-        variable=rel_thr_var,
-        command=_rel_thr_changed
+        variable=rag_thr_var,
+        command=_rag_thr_changed,
     )
-    rel_thr.pack(side=tk.LEFT, padx=(0, 8))
+    rag_thr.pack(side=tk.LEFT, padx=(0, 8), fill=tk.X, expand=True)
 
-    def _save_rel_thr_event(_evt=None):
-        try:
-            fv = float(rel_thr_var.get())
-            fv = max(0.05, min(0.35, round(fv, 2)))
-            rel_thr_var.set(fv)
-            rel_thr_val.set(f"{fv:.2f}")
-            s["rel_sim_threshold"] = fv
-            save_settings(s)
-        except Exception:
-            pass
+    rag_thr.bind("<ButtonRelease-1>", _save_rag_thr_event)
+    rag_thr.bind("<KeyRelease-Left>", _save_rag_thr_event)
+    rag_thr.bind("<KeyRelease-Right>", _save_rag_thr_event)
 
-    rel_thr.bind("<ButtonRelease-1>", _save_rel_thr_event)
-    rel_thr.bind("<KeyRelease-Left>", _save_rel_thr_event)
-    rel_thr.bind("<KeyRelease-Right>", _save_rel_thr_event)
-
-
+    ttk.Label(right, text="RAG結果").pack(anchor="w", pady=(6, 0))
 
     rag_list = tk.Listbox(right, height=6)
-    rag_list.pack(fill=tk.X)
+    rag_list.pack(fill=tk.X, pady=(0, 6))
 
     def do_rag():
         q = qv.get().strip()
@@ -1844,7 +1911,8 @@ def run():
         if i == 0:
             rag_list.insert(tk.END, "該当なし（しきい値で除外）")
 
-    ttk.Button(rt, text="検索", command=do_rag).pack(side=tk.LEFT)
+    ttk.Button(rt, text="検索", command=do_rag).pack(side=tk.LEFT, padx=(6, 0))
+    rag_entry.bind("<Return>", lambda _e: do_rag())
 
     title_var = tk.StringVar(value="")
     ttk.Label(right, textvariable=title_var, font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(8, 0))
@@ -1919,6 +1987,21 @@ def run():
             show_doc(did)
 
     docs.bind("<<ListboxSelect>>", on_docs)
+    def _select_all_docs(_=None):
+        docs.select_set(0, tk.END)
+        return "break"
+
+    def _select_all_terms(_=None):
+        rel.select_set(0, tk.END)
+        return "break"
+
+    docs.bind("<Delete>", lambda _e: delete_doc_selected())
+    rel.bind("<Delete>", lambda _e: delete_kw_selected())
+    docs.bind("<Control-a>", _select_all_docs)
+    docs.bind("<Control-A>", _select_all_docs)
+    rel.bind("<Control-a>", _select_all_terms)
+    rel.bind("<Control-A>", _select_all_terms)
+
 
     def on_rag(_=None):
         sel = rag_list.curselection()
